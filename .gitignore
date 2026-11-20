@@ -1,0 +1,29 @@
+# --- Training / run output: NEVER commit (see CLAUDE.md rule 9) ---
+logs/
+outputs/
+runs/
+wandb/
+videos/
+*.tfevents.*
+events.out.*
+NvStreamer-*.etli
+
+# Model files are ignored everywhere except the released policies folder
+*.pt
+*.pth
+*.onnx
+!policies/**/*.pt
+!policies/**/*.onnx
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store

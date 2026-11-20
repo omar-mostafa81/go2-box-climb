@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "go2_box_climb"
+version = "0.1.0"
+description = "Box-assisted platform climbing for the Unitree Go2 (ROB-GY 6323 course project)."
+requires-python = ">=3.12"
+# Isaac Sim / Isaac Lab / torch are NOT listed here: they are installed from
+# env/isaaclab-requirements.lock.txt (see docs/installation.md).
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["go2_box_climb*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
