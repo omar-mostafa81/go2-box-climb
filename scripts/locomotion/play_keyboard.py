@@ -31,6 +31,9 @@ Examples (from the repository root):
     # No keyboard: replay fixed commands "vx,vy,wz,seconds[,height];..." (for tests)
     python scripts/locomotion/play_keyboard.py --policy <...>/policy.pt --mode headless --auto "0.3,0,0,8,0.27;0,0,0,2"
 
+    # Same run, recorded (camera follows the robot) to videos/play_keyboard_basic_<date_time>.mp4
+    python scripts/locomotion/play_keyboard.py --mode headless --video --auto "0.3,0,0,8,0.27;0,0,0,2"
+
 --policy accepts an exported TorchScript policy.pt, or a training checkpoint
 model_<N>.pt (it is exported automatically to <run>/exported/model_<N>_policy.pt).
 """
@@ -73,6 +76,7 @@ from go2_box_climb.common import constants as C  # noqa: E402
 from go2_box_climb.common.state import TaskState  # noqa: E402
 from go2_box_climb.envs.scene import get_scene_cfg_class  # noqa: E402
 from go2_box_climb.skills.locomotion import COMMAND_LIMITS, DEFAULT_BODY_HEIGHT, WalkSkill, has_fallen  # noqa: E402
+from go2_box_climb.utils.video import VideoRecorder  # noqa: E402
 
 # Window keys: holding a key commands  level x max  on that axis (max = the trained limit).
 # '=' / '-' change the level in 0.1 steps, so forward, sideways and turning speed change together.
@@ -289,6 +293,7 @@ def main():
         walk.reset(read_state())
 
     reset_world()
+    video = VideoRecorder(f"play_keyboard_{args.scene}", fps=1 / C.POLICY_DT, enabled=args.video)  # 1 frame per step
     print("[INFO] Running. Close the window (or press Ctrl+C) to stop.")
     step, fallen_reported = 0, False
     while simulation_app.is_running():
@@ -312,12 +317,13 @@ def main():
             scene.update(C.SIM_DT)
         step += 1
 
-        # --- camera: behind the robot, looking where it walks ---
-        if keys.follow_camera and args.mode != "headless":
+        # --- camera: behind the robot, looking where it walks (also when recording headless) ---
+        if keys.follow_camera and (args.mode != "headless" or args.video):
             yaw = 2 * np.arctan2(state.base_quat[2], state.base_quat[3])
             back = np.array([-1.8 * np.cos(yaw) + 0.9 * np.sin(yaw), -1.8 * np.sin(yaw) - 0.9 * np.cos(yaw)])
             p = state.base_pos + origin
             sim.set_camera_view(eye=(p[0] + back[0], p[1] + back[1], 1.1), target=(p[0], p[1], 0.25))
+        video.capture()
 
         # --- status line every 0.5 s ---
         if step % 25 == 0:
@@ -341,6 +347,7 @@ def main():
             break
         if args.mode != "headless":  # keep real time so the keys feel right
             time.sleep(max(0.0, C.POLICY_DT - (time.time() - t0)))
+    video.close()
 
     s = read_state()
     print(f"\n[INFO] End: robot at {np.round(s.base_pos, 2).tolist()}, box at {np.round(s.box_pos, 3).tolist()}, "

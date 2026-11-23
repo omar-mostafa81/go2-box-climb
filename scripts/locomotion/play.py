@@ -9,6 +9,9 @@ pushes. It also exports the network next to the checkpoint:
 Examples (from the repository root):
     python scripts/locomotion/play.py --stage a --mode gui --checkpoint logs/rsl_rl/go2_walk/<run>/model_999.pt
     python scripts/locomotion/play.py --stage b --mode stream --checkpoint logs/rsl_rl/go2_walk_push/<run>/model_1799.pt
+
+    # No window (e.g. on the cluster): record 10 s to videos/play_stage_a_<date_time>.mp4
+    python scripts/locomotion/play.py --stage a --mode headless --video --duration 10 --checkpoint logs/rsl_rl/go2_walk/<run>/model_999.pt
 """
 
 import argparse
@@ -22,6 +25,8 @@ parser.add_argument("--num_envs", type=int, default=16)
 parser.add_argument("--duration", type=float, default=None, help="Stop after this many seconds (default: until closed).")
 add_launch_args(parser, default_mode="gui")
 args = parser.parse_args()
+if args.video and args.mode == "headless" and args.duration is None:
+    parser.error("--video in headless mode needs --duration (how many seconds to record)")
 simulation_app = launch(args)
 
 # --- Everything below needs the simulator to be running ---
@@ -37,6 +42,7 @@ from rsl_rl.runners import OnPolicyRunner  # noqa: E402
 from go2_box_climb.common import constants as C  # noqa: E402
 from go2_box_climb.envs.locomotion.agents import WalkPPORunnerCfg, WalkPushPPORunnerCfg  # noqa: E402
 from go2_box_climb.envs.locomotion.walk_env_cfg import WalkEnvCfg, WalkPushEnvCfg  # noqa: E402
+from go2_box_climb.utils.video import VideoRecorder  # noqa: E402
 
 
 def main():
@@ -63,13 +69,16 @@ def main():
 
     obs = env.get_observations()
     sim_time = 0.0
+    video = VideoRecorder(f"play_stage_{args.stage}", fps=1 / C.POLICY_DT, enabled=args.video)  # 1 frame per step
     print("[INFO] Playing. Close the window (or press Ctrl+C) to stop.")
     while simulation_app.is_running():
         if args.duration is not None and sim_time >= args.duration:
             break
         with torch.inference_mode():
             obs, _, _, _ = env.step(policy(obs))
+        video.capture()
         sim_time += C.POLICY_DT
+    video.close()
     env.close()
 
 

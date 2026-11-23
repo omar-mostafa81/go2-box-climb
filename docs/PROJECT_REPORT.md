@@ -40,7 +40,8 @@ Each step starts where the previous one ended, so a small mistake early on
 | `docs/figures/` | Plots and images used in this report |
 | `env/isaaclab-requirements.lock.txt` | Exact versions of every Python package |
 | `go2_box_climb/common/` | **Shared contracts** (Isaac-free): robot settings, scene geometry, state, skill interface, file formats |
-| `go2_box_climb/utils/launch.py` | Starts Isaac Sim in `headless`, `gui` or `stream` mode |
+| `go2_box_climb/utils/launch.py` | Starts Isaac Sim in `headless`, `gui` or `stream` mode; `--video` keeps a camera to record from, also headless |
+| `go2_box_climb/utils/video.py` | `VideoRecorder`: saves what the camera sees as an MP4 in `videos/` (the `--video` option) |
 | `go2_box_climb/utils/runs.py` | Where training runs are saved (`logs/rsl_rl/...` at the repository root) |
 | `go2_box_climb/utils/training_plots.py` | Draws training curves (PNG) from a run's TensorBoard log; redrawn live during training |
 | `go2_box_climb/assets/` | Robot, box and platform configurations; `warehouse.py` holds the warehouse look (delivery box, staging platform, decorations, building) and `spawners.py` the "cuboid physics, detailed look" spawner |
@@ -57,7 +58,7 @@ Each step starts where the previous one ended, so a small mistake early on
 | `tests/` | Fast tests that do not need the simulator (`pytest`) |
 | `policies/` | Released policies — the only model files kept in git. `walking/policy.pt` (+ `README.md` training note) is the walking policy |
 | `references/` | Jump reference trajectories from trajectory optimization (`jump_ground_to_box.npz`, `jump_box_to_platform.npz`), computed once offline; committed like the policies _(empty for now)_ |
-| `logs/`, `outputs/` | Training/run output — ignored by git, never pushed |
+| `logs/`, `outputs/`, `videos/` | Training/run output and recorded videos — ignored by git, never pushed |
 
 ## 4. Milestones
 
@@ -112,7 +113,33 @@ without a window and you watch from another computer with NVIDIA's streaming
 client, connecting to the IP address the script prints. The IP is detected
 automatically, so the same command works on every teammate's machine.
 
+**Recording videos (`--video`).** Watching live needs a screen or open network
+ports, which a cluster often does not give you. So the playback scripts
+(`scripts/locomotion/play.py` and `play_keyboard.py` for now) also take
+`--video`: they save what the camera sees as an MP4 in `videos/` (ignored by
+git). It works in every mode, also `--mode headless`. There the camera is
+rendered off screen (no window is opened) and you copy the file to your laptop.
+This is how we check a policy's movements while tuning its rewards.
+- One frame is saved per policy step (50 per second), so the video plays at
+  real speed. In `play_keyboard.py` the camera follows the robot.
+- The frames come from Isaac Lab's own viewport capture: `render_rgb_array()`
+  of the Kit visualizer, Isaac Lab's built-in viewer.
+- The file is written with OpenCV, which is already installed. Isaac Lab's own
+  recorder needs the `moviepy` package, which is not in our lock file, so using
+  it would change everyone's install.
+- Any script can record with three lines, using `VideoRecorder` from
+  `utils/video.py`: create it, call `capture()` after every step, and `close()`
+  at the end. If a script stops early (Ctrl+C), `close_app` still finishes the
+  file.
+
+```bash
+python scripts/locomotion/play_keyboard.py --mode headless --video --auto "0.3,0,0,8,0.27;0,0,0,2"
+python scripts/locomotion/play.py --stage a --mode headless --video --duration 10 --checkpoint logs/rsl_rl/go2_walk/<run>/model_999.pt
+```
+
 **How to test.** `python -m pytest -q` checks the contracts (6 tests).
+`tests/test_video.py` checks the video recorder without the simulator: it writes
+a short MP4 and reads it back (2 tests).
 
 ### 4.1 Isaac Lab scenes (basic and warehouse)
 

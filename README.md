@@ -56,6 +56,23 @@ Both computers must be on the same network (or VPN). If the client cannot
 connect, check that the firewall on the simulation computer allows ports
 **49100 (TCP)** and **47998 (UDP)**. Only one client can be connected at a time.
 
+### Recording a video (`--video`)
+
+When you cannot watch live (for example on a cluster), add `--video` to a
+playback script. It saves what the camera sees as an MP4 in `videos/` (ignored
+by git). It also works with `--mode headless`: no window is opened.
+
+```bash
+python scripts/locomotion/play_keyboard.py --mode headless --video --auto "0.3,0,0,8,0.27;0,0,0,2"
+python scripts/locomotion/play.py --stage a --mode headless --video --duration 10 --checkpoint logs/rsl_rl/go2_walk/<run>/model_999.pt
+```
+
+The script prints `[VIDEO] Saved ... to: .../videos/<name>_<date_time>.mp4`.
+Copy that file to your computer to watch it, for example with
+`scp <user>@<cluster>:<path to repo>/videos/*.mp4 .`. Recording works in
+`scripts/locomotion/play.py` and `play_keyboard.py` so far. Other scripts accept
+the flag but do not record yet.
+
 ## Repository layout
 
 See "Repository layout" in [docs/PROJECT_REPORT.md](docs/PROJECT_REPORT.md).
