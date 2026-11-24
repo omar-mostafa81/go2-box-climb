@@ -49,11 +49,11 @@ Each step starts where the previous one ended, so a small mistake early on
 | `go2_box_climb/envs/jump_from_tracking/` | Training env of the TO-guided jump policy (basic scene) _(empty for now)_ |
 | `go2_box_climb/envs/jump_from_scratch/` | Training env of the from-scratch jump policy (basic scene) _(empty for now)_ |
 | `go2_box_climb/skills/locomotion/` | Runs the walking policy without the simulator: `WalkingPolicy` (command + state → joint actions), `WalkSkill` |
-| `go2_box_climb/skills/push_mppi/` | MPPI pusher _(empty for now)_ |
+| `go2_box_climb/skills/push_mppi/` | MPPI push skill (no simulator needed): planar robot-box model, cost, MPPI planner, `PushMPPISkill` |
 | `go2_box_climb/skills/jump/` | Jump skills: `to/` (trajectory optimization + IK, run once offline → reference files), `jump_from_tracking/`, `jump_from_scratch/` (run the trained jump policies) _(empty for now)_ |
 | `go2_box_climb/sequencer/` | Value-based sequencer _(empty for now)_ |
 | `go2_box_climb/eval/` | Trial runner and logging for the studies, including the one jump evaluation that compares both jump policies _(empty for now)_ |
-| `scripts/` | Runnable programs: `view_scene.py`; `plot_training.py` (plot or compare runs); `locomotion/train.py`, `play.py`, `eval.py`, `play_keyboard.py` (walking policy) |
+| `scripts/` | Runnable programs: `view_scene.py`; `plot_training.py` (plot or compare runs); `locomotion/train.py`, `play.py`, `eval.py`, `play_keyboard.py` (walking policy); `push_mppi/run_push.py` (run and evaluate the push skill) and `push_mppi/scenarios.py` (the test start poses A–E) |
 | `tests/` | Fast tests that do not need the simulator (`pytest`) |
 | `policies/` | Released policies — the only model files kept in git. `walking/policy.pt` (+ `README.md` training note) is the walking policy |
 | `references/` | Jump reference trajectories from trajectory optimization (`jump_ground_to_box.npz`, `jump_box_to_platform.npz`), computed once offline; committed like the policies _(empty for now)_ |
@@ -333,7 +333,173 @@ _Not started._
 _Not started._
 
 ### 4.5 Push skill (MPPI)
-_Not started._
+
+**What it does.** Pushes the box until it is flush against the platform face (box center
+at x = 1.7 m, y = 0, square to the platform), then stands still. This puts the box where
+the two jumps expect it. The box is square (0.6 × 0.6 m), so **any of its four sides may
+end flush**: the skill pushes whichever side moves the box toward the goal. The skill does
+not move the legs itself: it plans walking commands (vx, vy, ωz) and the walking policy
+(4.2) turns them into joint targets.
+
+**Method: MPPI.** MPPI (Model Predictive Path Integral control) is a sampling-based
+form of MPC (model predictive control: plan a short future, apply only the first
+step, plan again). Every 0.1 s it:
+
+1. takes the current plan (40 steps of (vx, vy, ωz) = 4 s), warm-started from the
+   last replan (shifted one step);
+2. makes K = 1042 noisy copies of it (Gaussian noise, std 0.15 m/s, 0.1 m/s,
+   0.3 rad/s), clipped to the allowed commands; copy 0 is the plan itself;
+3. simulates every copy on a simple planar model and adds up its cost S;
+4. averages the copies with weights exp(−(S − min S)/λ), λ = 1: cheap futures
+   count much more;
+5. sends the first command and holds it until the next replan (5 policy steps).
+
+One replan takes about 37 ms on the CPU (numpy, all K rollouts at once), inside the
+0.1 s budget. The 4 s horizon is long enough to "see" walking around the box to another side.
+
+**Why MPPI on a simple model.** Box contact is hard to differentiate (contact on/off,
+corners), and MPPI needs no gradients: it only has to *simulate* candidates. A
+planar model is fast enough to simulate 1042 × 40 steps every 0.1 s, and the walking
+policy already hides the leg dynamics, so the planner only reasons about where the
+body and the box go.
+
+**Planar model** (`model.py`). State [robot x, y, yaw, box x, y, yaw]:
+
+- Robot: holonomic (can move in any direction); the body-frame command is rotated
+  into the world frame and integrated. This works because the walking policy tracks
+  slow commands closely.
+- Contact: a single "head point" 0.343 m ahead of the base. This is the head frame read
+  from the Go2 USD (0.293 m, via `go2_geometry()`) plus a 0.05 m margin for the head's
+  collision shape, found in simulation. Only this point touches the box: the robot's
+  body and legs are not modeled.
+- Push: when the head point is inside the box outline, the robot pushes the side it is
+  nearest to. The box slides along that side's inward normal by the same amount. An
+  off-center push also turns it: Δyaw = −d·p / (c² + d²), with d the offset from the side
+  center, p the push distance and c the box's radius of gyration. A push through the
+  center only moves the box; a push near a corner mostly turns it.
+- Wall: the box's front-most point cannot pass the platform face (x = 2.0 m); a crooked
+  box pressed against the wall straightens toward the nearest multiple of 90°. The head
+  cannot go into the box from any side.
+
+**Push point ("shopping cart" rule).** To move a box in some direction, stand on the
+opposite side and push. At every predicted state: d = unit vector from the box center to
+the goal (the way the box must move); the **push point** is where the line from the box
+center along −d leaves the box outline (0.30 m from the center through a side, up to
+0.42 m through a corner). From the normal start it is the center of the back side; for a
+box already flush but shifted to +y it is the center of the +y side, with the robot facing
+−y. When the box is within 2 cm of the goal there is no push point.
+
+**Controls.** (vx, vy, ωz) only, clipped to vx −0.3…0.4 m/s, vy ±0.3 m/s,
+ωz ±0.6 rad/s (inside the walking policy's training range; slow, so the policy tracks
+them well). Body height h is a fixed rule, not planned: 0.27 m (low, so the head hits the
+box face below its top) when the head is within 0.80 m of the push point, else 0.32 m
+(normal walking). From the normal start the head is already 0.36 m from the push point,
+so the robot walks low the whole push.
+
+**Cost** (`cost.py`; weights in `CostWeights`, SI units). The running cost is summed over
+the 40 steps, and the terminal cost is added once for the last predicted state. The box is
+square, so every box yaw error is taken modulo 90° (in ±45°): any side may face the platform.
+
+| Term | Formula (plain words) | Weight | When active |
+| --- | --- | --- | --- |
+| *Running cost (every step)* | | | |
+| `box_pos` | (distance from box center to goal)² [m²] + \|x error\| + \|y error\| [m] | 50; 20, 20 | always (main goal; the linear part keeps pulling when only a few cm off) |
+| `aim` | (box yaw − direction from box to goal)² [rad²] | 20 | box more than 0.15 m (in x) from the goal: point a side at the goal, so pushing straight also centers it |
+| `box_yaw` | (box yaw)² [rad²] | 20 | box within 0.15 m (in x) of the goal: square to the platform at the end |
+| `approach` | distance from the head to the push point [m] | 5 | when there is a push point (box more than 2 cm from the goal) |
+| `heading` | (robot yaw − direction of d)² [rad²] | 5 | when there is a push point: face the way the box must move |
+| `box_speed` | (box speed)² [m²/s²] | 5 | box center within 3 cm of the goal: arrive gently |
+| `effort` | vx², vy², ωz² | 0.5, 0.5, 0.3 | always (turning is the cheapest, so the robot can turn freely to face the push point) |
+| `smooth` | (change of command between steps)² | 2 | always |
+| `corner` | (how far the head is inside the 0.10 m corner zone of the side it touches)² [m²] | 500 | head within 5 cm of a box side: do not push the corner |
+| `platform` | 1 if the head is at or past the platform face, else 0 | 1000 | always: never walk into the platform |
+| *Terminal cost (last state only)* | | | |
+| `terminal` | `box_pos` + `aim` + `box_yaw` of the last predicted state | × 50 | once per rollout: the plan is judged mostly by where the box ends at the end of the horizon |
+
+The running cost also returns each term separately, so it can be logged and tuned;
+`run_push.py` logs them every step.
+
+**End of the skill** (`status()`; the reason is kept in `end_reason`). The skill waits
+until the box has *settled*: its front is within 1 cm of the platform face and it moves
+slower than 1 cm/s, for 1 s in a row. The box can only count as settled after the robot
+has **pushed from the push point** (head within 5 cm of it, and the box moved at least
+2 cm since then): a box that starts flush but off center is not "done" before the robot
+acts. Once settled, the robot is commanded to stand still and:
+
+| End reason | Result | When |
+| --- | --- | --- |
+| `success` | SUCCESS | settled, and box \|y\| and \|yaw\| within the tolerance |
+| `box_off_center` | FAILURE | settled, but y or yaw outside the tolerance |
+| `no_contact` | FAILURE | the head has not touched the box after 15 s |
+| `fell` | FAILURE | the robot fell (same check as the walking skill) |
+| `timeout` | FAILURE | none of the above after 30 s |
+
+Only y and yaw decide success, because settling already means the box is flush. The
+tolerances (`PushConfig`) are, for now, the box placements the jump policies are trained
+on (`BOX_GAP_RANGE`, `BOX_LATERAL_RANGE`, `BOX_YAW_RANGE` in `common/constants.py`):
+gap ≤ 15 cm, \|y\| ≤ 15 cm, \|yaw\| ≤ 15°. They are provisional until the box placement
+study (5.1) shows what the jumps really need. A second, **tight** level (gap ≤ 2 cm,
+\|y\| ≤ 3 cm, \|yaw\| ≤ 3°) is the target the cost is tuned for; it is reported but does not
+decide success.
+
+**Randomization.** None inside the skill. Test start poses are set by the scripts
+(scenarios A–E below).
+
+**Results: normal start (scenario A)** (`run_push.py --scenario A`, basic scene, Isaac Sim;
+the simulation and the planner seed are deterministic, so every episode is the same):
+
+| Result | Time | Final box: gap to platform | y | yaw | Side pushed |
+| --- | --- | --- | --- | --- | --- |
+| success (also tight) | 4.7 s | 0.0 cm | −1.4 cm | 0.0° | back (170 steps) |
+
+- The robot walks up crouched at about 0.4 m/s, reaches the box after about 1.2 s, and
+  pushes it 0.7 m in about 2.5 s. The last 1 s is the settle check.
+- The turning and sideways commands are noisy (MPPI sampling noise); the walking
+  policy smooths most of it out.
+
+![Scenario A: box state, commands, cost terms](figures/push_mppi_episode.png)
+
+**Test scenarios** (`scripts/push_mppi/scenarios.py`; box center x, y, yaw; the robot
+always starts at its normal start): A normal (1.0, 0, 0°), B turned 90° (1.0, 0, 90°),
+C turned 45° (1.0, 0, 45°), D flush, 10 cm off center (1.7, +0.10, 0°), E flush, 40 cm off
+center (1.7, +0.40, 0°, worst case). They are only for testing; the skill does not know
+about them.
+
+**Next steps (mini goals).** Improve the cost function so the push generalizes better to
+boxes that start turned (scenarios B, C) or off center (D, E), not only to the normal start:
+
+1. Reach the push point and push from it when the box starts turned or off center,
+   instead of pushing the nearest side.
+2. Re-center a box that is already flush against the platform (D, E) by pushing it sideways.
+3. Check every change in Isaac Sim on all scenarios A–E (commands below), not only on A.
+
+**How to run.**
+```bash
+python -m pytest -q tests/test_push_mppi.py                                  # fast tests, no simulator
+
+# Isaac Sim, evaluate one scenario without a window (default: the normal start)
+python scripts/push_mppi/run_push.py --mode headless --scenario A --episodes 1
+
+# Isaac Sim, watch each scenario over the stream (connect while it runs)
+python scripts/push_mppi/run_push.py --mode stream --scenario A --episodes 7 --timeout 40   # normal start
+python scripts/push_mppi/run_push.py --mode stream --scenario B --episodes 7 --timeout 40   # turned 90°
+python scripts/push_mppi/run_push.py --mode stream --scenario C --episodes 7 --timeout 40   # turned 45°
+python scripts/push_mppi/run_push.py --mode stream --scenario D --episodes 7 --timeout 40   # flush, 10 cm off center
+python scripts/push_mppi/run_push.py --mode stream --scenario E --episodes 7 --timeout 40   # flush, 40 cm off center
+```
+In stream mode the app closes as soon as the last episode ends, so run several episodes
+to have time to connect the client.
+
+`run_push.py` options: `--scenario A|B|C|D|E`, `--horizon` (planner steps of 0.1 s),
+`--samples` (rollouts per replan), `--timeout` (s), `--contact_margin`, `--scene`. The
+first three default to the `MPPIConfig` / `PushConfig` values (40, 1042, 30 s); the values
+used are printed at the start. Each run writes `steps.csv` (pose, command, cost terms and
+the box side the head touches, per step), `episodes.csv` (result, end reason, final box
+pose, steps per touched side) and `push.png` to `logs/push_mppi/<date_time>/`.
+
+**Code.** `go2_box_climb/skills/push_mppi/` (`model.py`, `cost.py`, `mppi.py`,
+`push_skill.py`; no simulator needed), `scripts/push_mppi/` (`run_push.py`,
+`scenarios.py`), `tests/test_push_mppi.py`.
 
 ### 4.6 Full chain: push → jump → jump
 _Not started._
