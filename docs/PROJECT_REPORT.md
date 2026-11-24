@@ -39,6 +39,7 @@ Each step starts where the previous one ended, so a small mistake early on
 | `docs/installation.md` | How to install the exact same Isaac Sim / Isaac Lab setup |
 | `docs/figures/` | Plots and images used in this report |
 | `env/isaaclab-requirements.lock.txt` | Exact versions of every Python package |
+| `env/torch/` | Running on the NYU Torch cluster: container launcher (`shell.sh`), conda startup script (`env.sh`), Vulkan fix (`nvidia_icd.json`), setup steps (`README.md`) |
 | `go2_box_climb/common/` | **Shared contracts** (Isaac-free): robot settings, scene geometry, state, skill interface, file formats |
 | `go2_box_climb/utils/launch.py` | Starts Isaac Sim in `headless`, `gui` or `stream` mode; `--video` keeps a camera to record from, also headless |
 | `go2_box_climb/utils/video.py` | `VideoRecorder`: saves what the camera sees as an MP4 in `videos/` (the `--video` option) |
