@@ -93,7 +93,7 @@ class JumpTrackingPolicy:
         self.start_xy = s["base_pos"][:, :2].clone()
         self.start_yaw = yaw_of(s["base_quat"])
         self.start_time = float(state.time)
-        self.last_action.zero_()
+        self.last_action = torch.zeros(1, C.NUM_JOINTS, device=self.device)
         if hasattr(self.net, "reset"):  # recurrent policies; ours is a plain MLP
             self.net.reset()
 
@@ -113,7 +113,7 @@ class JumpTrackingPolicy:
             **s,
         )
 
-    @torch.inference_mode()
+    @torch.no_grad()  # not inference_mode: its tensors (the stored last action) could not be changed later
     def act(self, state: TaskState) -> np.ndarray:
         """12 joint actions for the current state (call once per POLICY_DT)."""
         action = self.net(self.observation(state))
