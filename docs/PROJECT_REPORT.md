@@ -48,14 +48,14 @@ Each step starts where the previous one ended, so a small mistake early on
 | `go2_box_climb/assets/` | Robot, box and platform configurations; `warehouse.py` holds the warehouse look (delivery box, staging platform, decorations, building) and `spawners.py` the "cuboid physics, detailed look" spawner |
 | `go2_box_climb/envs/scene/` | The shared scenes, picked with `--scene`: `basic` (plain floor; jump training) and `warehouse` (final test world) |
 | `go2_box_climb/envs/locomotion/` | Walking training task: environment (stage A walking, stage B + steady push), PPO settings, push force and its ramp |
-| `go2_box_climb/envs/jump_from_tracking/` | Training env of the TO-guided jump policy (basic scene) _(empty for now)_ |
+| `go2_box_climb/envs/jump_from_tracking/` | Training env of the TO-guided jump policy (basic scene): one config for both jumps, start conditions and reference anchor, rewards, success termination, PPO settings, jump training plot |
 | `go2_box_climb/envs/jump_from_scratch/` | Training env of the from-scratch jump policy (basic scene) _(empty for now)_ |
 | `go2_box_climb/skills/locomotion/` | Runs the walking policy without the simulator: `WalkingPolicy` (command + state → joint actions), `WalkSkill` |
 | `go2_box_climb/skills/push_mppi/` | MPPI pusher _(empty for now)_ |
-| `go2_box_climb/skills/jump/` | Jump skills: `to/` (trajectory optimization + IK, run once offline → reference files), `jump_from_tracking/`, `jump_from_scratch/` (run the trained jump policies) _(empty for now)_ |
+| `go2_box_climb/skills/jump/` | Jump skills: `to/` (trajectory optimization + IK, run once offline → reference files) _(empty for now)_; `jump_from_tracking/` (Isaac-free: reference lookup and placeholder, foot kinematics, start conditions, success checks, the policy observation, and `JumpTrackingSkill`); `jump_from_scratch/` _(empty for now)_ |
 | `go2_box_climb/sequencer/` | Value-based sequencer _(empty for now)_ |
 | `go2_box_climb/eval/` | Trial runner and logging for the studies, including the one jump evaluation that compares both jump policies _(empty for now)_ |
-| `scripts/` | Runnable programs: `view_scene.py`; `plot_training.py` (plot or compare runs); `locomotion/train.py`, `play.py`, `eval.py`, `play_keyboard.py` (walking policy) |
+| `scripts/` | Runnable programs: `view_scene.py`; `plot_training.py` (plot or compare runs); `locomotion/train.py`, `play.py`, `eval.py`, `play_keyboard.py` (walking policy); `jump_from_tracking/make_placeholder_reference.py`, `train.py`, `play.py`, `eval.py` (TO-guided jump policy) |
 | `tests/` | Fast tests that do not need the simulator (`pytest`) |
 | `policies/` | Released policies — the only model files kept in git. `walking/policy.pt` (+ `README.md` training note) is the walking policy |
 | `references/` | Jump reference trajectories from trajectory optimization (`jump_ground_to_box.npz`, `jump_box_to_platform.npz`), computed once offline; committed like the policies _(empty for now)_ |
@@ -358,6 +358,141 @@ simulator needed), `scripts/locomotion/`.
 _Not started._
 
 ### 4.4 Jump policies (TO-guided RL and RL from scratch)
+
+#### TO-guided jump policy (jump from tracking)
+
+**Status.** The full pipeline (environment, training, playback, evaluation, skill) is
+built and tested with a **placeholder** reference. It has not been trained on the real
+references yet (they come from 4.3).
+
+**What it does.** One PPO policy per jump (ground → box, box → platform) turns the
+robot's state and the jump's **reference** into 12 joint targets at 50 Hz. The
+reference is the jump planned by trajectory optimization + IK (a `JumpReference`
+file in `references/`): base position and orientation, joint angles and foot
+contacts over time, for the ideal case (box flush, centered, square). The policy is
+trained to follow it from imperfect starts and to land. After training it jumps on
+its own; trajectory optimization is not run at deployment.
+
+**Design choices.**
+- *Phase clock.* The reference time is the time since the attempt started
+  (`episode_length × 0.02 s`). Every episode is one attempt and starts at reference
+  time 0, with the robot placed in the reference's first pose. After the reference
+  ends, its last pose is held, so the policy learns to settle.
+- *Anchoring.* Each attempt starts from a different place and heading. The reference's
+  horizontal motion and heading are moved onto the robot's actual start (shifted and
+  turned about z). Heights are not moved, because they are measured from the ground,
+  which keeps the box and platform heights right.
+- *One observation function.* The observation is built by one Isaac-free function,
+  used both in training and by the skill that runs the policy, so the two always match.
+- *Placeholder.* Until the real references exist, `make_placeholder_reference.py`
+  writes a smooth fake jump in the same format to the git-ignored `outputs/`: crouch,
+  push off, flight, land, settle. The feet sit exactly on the start and target surfaces
+  (from the leg geometry of the Go2 model). It is not physically planned; it only lets
+  every part be built and checked.
+
+**Start conditions** (every attempt, ranges from `common/constants.py`, the same as
+the box-placement study):
+
+| What | Range |
+| --- | --- |
+| Box gap to the platform face (to the box's nearest corner, so a rotated box never overlaps the platform) | 0–0.15 m |
+| Box sideways offset / rotation | ±0.15 m / ±15° |
+| Robot heading: jump 1 relative to +x (the jump direction); jump 2 relative to the box (so all feet stay on a rotated box) | ±10° |
+| Jump 1: base behind the middle of the box's front face | 0.35–0.60 m |
+| Jump 2: base on the box, where the reference starts relative to the box | — |
+
+The robot starts in the reference's first pose (joint angles, base height, body tilt),
+standing still.
+
+**Observations (77).** No scaling; "body frame" = the robot's current base frame.
+
+| Inputs | Size |
+| --- | --- |
+| base linear velocity [m/s], angular velocity [rad/s], gravity direction (body frame) | 3 + 3 + 3 |
+| joint angles − default pose [rad], joint velocities [rad/s], previous action | 12 + 12 + 12 |
+| phase: time / reference duration, clipped to [0, 1] | 1 |
+| reference at the next step: joint angles − default pose [rad] | 12 |
+| reference at the next step: base position − current base position (body frame) [m] | 3 |
+| reference at the next step: orientation relative to the current one (quaternion) | 4 |
+| reference at the next step: planned foot contacts (1 = on a surface) | 4 |
+| box center relative to the base (body frame) [m]; box heading relative to the robot (cos, sin) | 3 + 2 |
+| platform front edge relative to the base (body frame) [m] | 3 |
+
+"Next step" (0.02 s ahead): the action chosen now is applied until then, and the
+tracking rewards compare the robot with the reference at that time.
+
+**Actions (12).** Joint targets = default pose + 0.25 × action, PD control (Kp 25,
+Kd 0.5, 200 Hz): the shared robot contract.
+
+**Rewards** (starting values, to be tuned on the real references). Tracking terms are
+exp(−error²/std²), 1 when perfect.
+
+| Term | Weight | std | Purpose |
+| --- | --- | --- | --- |
+| joint angles (sum of the 12 squared errors) | +2.0 | 0.6 rad | follow the planned motion |
+| base height | +1.0 | 0.05 m | jump high enough, land at the right height |
+| base horizontal position | +1.0 | 0.15 m | follow the path (loose: the landing may shift to the actual box) |
+| base orientation (rotation angle) | +1.0 | 0.3 rad | keep the planned body attitude |
+| foot contacts match the plan (fraction of feet) | +0.5 | — | take off and land on time |
+| success (once) | +250 | — | land and settle |
+| fall (once) | −250 | — | avoid falls |
+| action change², torque², joint acceleration², joint limits | −0.01, −2e-4, −2.5e-7, −5.0 | — | smooth, low effort |
+
+Isaac Lab multiplies every term by 0.02 s, so the one-time success bonus and fall
+penalty are worth ±5.
+
+**Episode end** (shared jump rules in `common/constants.py`, the same as the
+from-scratch policy):
+- *Success:* for 1.0 s without a break, the body tilt stays below 20°, the base speed
+  below 0.2 m/s, and all 4 feet are on the target surface (box top or platform top):
+  within 3 cm of its height and inside its outline. "All 4 feet" is this part's reading
+  of the shared rule.
+- *Fall:* trunk or head touches anything, or the body tilts more than 60°.
+- *Time limit:* 3.0 s.
+
+**Randomization.** Start conditions above; body friction 0.4–1.25 and base mass ±25%
+(as in walking).
+
+**Training.** PPO (rsl_rl) with the walking policy's settings as the start: 4096 robots,
+24 steps per robot per update, actor and critic MLPs 512-256-128 (ELU), learning rate
+1e-3 (adaptive, target KL 0.01), γ 0.99, λ 0.95, clip 0.2, entropy 0.01, 5 epochs × 4
+mini-batches, 1500 iterations. Episodes are not started at random lengths, because each
+one must begin at reference time 0. Besides the shared plots, each run draws
+`plots/jump.png`: how the attempts end (success, contact fall, tilt fall, time limit),
+the joint and base tracking errors, and the episode length.
+
+**Checks without training.** `play.py --open_loop` and `eval.py --open_loop` drive the
+motors straight from the reference's joint angles, with no policy. This tests the
+environment end to end, shows what the reference alone achieves, and checks the leg
+kinematics (`kinematics.py`) against the simulator's foot positions.
+
+**Results.** Not trained yet (waiting for the references from 4.3).
+
+**How to run.**
+```bash
+python -m pytest -q tests/test_jump_from_tracking.py                       # fast checks, no simulator
+python scripts/jump_from_tracking/make_placeholder_reference.py            # placeholder references -> outputs/
+REF=outputs/jump_from_tracking/placeholder_jump_ground_to_box.npz          # omit --reference once references/ has the real file
+python scripts/jump_from_tracking/play.py --jump ground_to_box --open_loop --mode headless --duration 6 --reference $REF
+python scripts/jump_from_tracking/eval.py --jump ground_to_box --open_loop --rounds 1 --reference $REF
+python scripts/jump_from_tracking/train.py --jump ground_to_box --reference $REF       # --max_iterations 20 for a quick check
+python scripts/jump_from_tracking/eval.py --jump ground_to_box --reference $REF --checkpoint logs/rsl_rl/go2_jump_track_ground_to_box/<run>/model_1499.pt
+python scripts/jump_from_tracking/play.py --jump ground_to_box --reference $REF --mode headless --video --duration 6 --checkpoint <run>/model_1499.pt
+```
+The same commands with `--jump box_to_platform` train and check jump 2. `eval.py` writes
+one shared trial-log row per attempt (`common/formats.py`) to `<run>/eval/`, plus a
+summary JSON.
+
+**Code.**
+- `go2_box_climb/envs/jump_from_tracking/`: `jump_env_cfg.py` (environment, reward
+  weights), `mdp.py` (reference and start-condition command, observation, rewards,
+  success termination, open-loop actions), `agents.py` (PPO), `plots.py` (jump plot).
+- `go2_box_climb/skills/jump/jump_from_tracking/` (Isaac-free): `reference.py`,
+  `start.py`, `kinematics.py`, `checks.py`, `observation.py`, `jump_math.py`,
+  `jump_policy.py` and `jump_skill.py` (`JumpTrackingSkill`, the `Skill` for the sequencer).
+- `scripts/jump_from_tracking/`, `tests/test_jump_from_tracking.py`.
+
+#### RL from scratch
 _Not started._
 
 ### 4.5 Push skill (MPPI)

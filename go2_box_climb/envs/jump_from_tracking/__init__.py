@@ -14,4 +14,11 @@ Rules:
       common/constants.py, the same ones as jump_from_scratch, so the comparison is
       fair. This method may add its own "too far from the reference" termination.
     * No code shared with jump_from_scratch: do not import from it.
+
+Isaac-dependent: import only after launching the app.
+    jump_env_cfg.py  JumpTrackEnvCfg (one config for both jumps: .configure(jump, reference_path))
+    mdp.py           reference/start-condition command, observation, rewards, success termination
+    agents.py        PPO settings (JumpTrackPPORunnerCfg)
+The Isaac-free parts (reference lookup, observation, checks) are in
+skills/jump/jump_from_tracking, shared with the deployed skill.
 """
