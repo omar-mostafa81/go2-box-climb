@@ -361,9 +361,9 @@ _Not started._
 
 #### TO-guided jump policy (jump from tracking)
 
-**Status.** The full pipeline (environment, training, playback, evaluation, skill) is
-built and tested with a **placeholder** reference, and the jump-1 reference from 4.3
-loads and runs in it. It has not been trained on the real references yet.
+**Status.** Jump 1 (ground → box) is trained on the real reference from 4.3 and lands
+in 100% of 1024 evaluation attempts in simulation (see Results). Jump 2 (box →
+platform) uses the same pipeline and waits for its reference.
 
 **What it does.** One PPO policy per jump (ground → box, box → platform) turns the
 robot's state and the jump's **reference** into 12 joint targets at 50 Hz. The
@@ -431,7 +431,7 @@ tracking rewards compare the robot with the reference at that time.
 **Actions (12).** Joint targets = default pose + 0.25 × action, PD control (Kp 25,
 Kd 0.5, 200 Hz): the shared robot contract.
 
-**Rewards** (starting values, to be tuned on the real references). Tracking terms are
+**Rewards** (the values of the trained jump-1 policy). Tracking terms are
 exp(−error²/std²), 1 when perfect.
 
 | Term | Weight | std | Purpose |
@@ -481,7 +481,7 @@ from-scratch policy):
 **Training.** PPO (rsl_rl) with the walking policy's settings as the start: 4096 robots,
 24 steps per robot per update, actor and critic MLPs 512-256-128 (ELU), learning rate
 1e-3 (adaptive, target KL 0.01), γ 0.99, λ 0.95, clip 0.2, entropy 0.01, 5 epochs × 4
-mini-batches, 1500 iterations (about 1 h on an A100). Episodes are not started at random
+mini-batches, 1500 iterations (about 1.5 h on one A100). Episodes are not started at random
 lengths, because each one must begin at its own reference time. Besides the shared plots,
 each run draws `plots/jump.png`: how the attempts end (success, contact fall, tilt fall,
 time limit, early stop), the curriculum level, the joint and base tracking errors, and the
@@ -493,7 +493,41 @@ motors straight from the reference's joint angles, with no policy. This tests th
 environment end to end, shows what the reference alone achieves, and checks the leg
 kinematics (`kinematics.py`) against the simulator's foot positions.
 
-**Results.** Not trained yet (waiting for the references from 4.3).
+**Results: jump 1 (ground → box).** Trained on the reference `jump_ground_to_box.npz`
+from 4.3, final checkpoint `model_1499.pt` (run `2026-11-28_11-01-23_full_v2`).
+
+*Evaluation* (`eval.py`): 1024 attempts (4 rounds × 256 robots), full start and box
+ranges, no training aids, and the policy's mean action (no random exploration).
+
+| Outcome | Share |
+| --- | --- |
+| Success | 100% |
+| Fall (contact or tilt) | 0% |
+| Time limit | 0% |
+
+Success was declared 1.9–2.44 s after the start (median 2.06 s). The reference lands at
+0.64 s and success needs 1.0 s of standing still, so the earliest possible time is about
+1.64 s: every attempt really jumped, landed and then settled, 0.3–0.8 s after the
+planned touch-down.
+
+*Training curves.* During training the success rate stays below 1% and almost every
+attempt reaches the time limit. This is most likely because training actions include
+PPO's random exploration noise (action std still 0.73 at the end): the body shakes, so it
+rarely stays below 0.2 m/s for a full second. The same policy without the noise
+succeeds every time, so `eval.py` is the measure. Early on most attempts hit the early
+stop (base more than 0.3 m from the reference); after about 250 iterations almost none do.
+Around iteration 1350 the policy found a closer copy of the reference: the base error
+dropped from about 8 cm to 3.5 cm, and the joint error from 0.9 to 0.5 rad (length of the
+12-joint error vector, about 0.15 rad per joint). Both errors are measured with the
+exploration noise on.
+
+![Jump 1: how attempts end, curriculum level, tracking errors](figures/jump_tracking_ground_to_box_attempts.png)
+![Jump 1: reward, losses, entropy, action noise, learning rate](figures/jump_tracking_ground_to_box_training.png)
+![Jump 1: reward terms](figures/jump_tracking_ground_to_box_rewards.png)
+
+*Limits.* Simulation only, with the same start/box ranges and friction/mass
+randomization as in training. The policy has not been checked on video yet (the A100
+GPUs used for training cannot render).
 
 **How to run.**
 ```bash
