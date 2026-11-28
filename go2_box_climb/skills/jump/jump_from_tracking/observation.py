@@ -32,7 +32,7 @@ import torch
 from go2_box_climb.common import constants as C
 
 from .jump_math import quat_conj, quat_mul, quat_rotate_inverse, wrap_angle, yaw_of
-from .reference import ReferenceTrack
+from .reference import Anchor, ReferenceTrack
 
 OBS_DIM = 77
 
@@ -62,8 +62,7 @@ def jump_observation(
     *,
     track: ReferenceTrack,
     time: torch.Tensor,
-    start_xy: torch.Tensor,
-    start_yaw: torch.Tensor,
+    anchor: Anchor,
     base_pos: torch.Tensor,
     base_quat: torch.Tensor,
     base_lin_vel: torch.Tensor,
@@ -79,7 +78,7 @@ def jump_observation(
     Args (batch of N; positions in env frame, velocities in world frame):
         track: the reference (on the same device as the tensors).
         time: (N,) time since the jump started [s].
-        start_xy, start_yaw: (N, 2), (N,) the robot's base position and heading at the jump start.
+        anchor: where the reference is placed in this attempt (robot start, landing target).
         base_pos, base_quat: (N, 3), (N, 4) base position and orientation (x, y, z, w).
         base_lin_vel, base_ang_vel: (N, 3) base velocities, world frame.
         joint_pos, joint_vel: (N, 12) in JOINT_NAMES order.
@@ -89,7 +88,7 @@ def jump_observation(
     dev, dt = base_pos.device, base_pos.dtype
     q0 = torch.as_tensor(C.DEFAULT_JOINT_POS, dtype=dt, device=dev)
     down = torch.tensor([0.0, 0.0, -1.0], dtype=dt, device=dev).expand_as(base_pos)
-    ref = track.at_anchored(time + C.POLICY_DT, start_xy, start_yaw)
+    ref = track.at_anchored(time + C.POLICY_DT, anchor)
 
     ref_quat_rel = quat_mul(quat_conj(base_quat), ref.base_quat)
     ref_quat_rel = torch.where(ref_quat_rel[:, 3:4] < 0, -ref_quat_rel, ref_quat_rel)

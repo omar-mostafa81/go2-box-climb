@@ -362,8 +362,8 @@ _Not started._
 #### TO-guided jump policy (jump from tracking)
 
 **Status.** The full pipeline (environment, training, playback, evaluation, skill) is
-built and tested with a **placeholder** reference. It has not been trained on the real
-references yet (they come from 4.3).
+built and tested with a **placeholder** reference, and the jump-1 reference from 4.3
+loads and runs in it. It has not been trained on the real references yet.
 
 **What it does.** One PPO policy per jump (ground → box, box → platform) turns the
 robot's state and the jump's **reference** into 12 joint targets at 50 Hz. The
@@ -378,10 +378,17 @@ its own; trajectory optimization is not run at deployment.
   (`episode_length × 0.02 s`). Every episode is one attempt and starts at reference
   time 0, with the robot placed in the reference's first pose. After the reference
   ends, its last pose is held, so the policy learns to settle.
-- *Anchoring.* Each attempt starts from a different place and heading. The reference's
-  horizontal motion and heading are moved onto the robot's actual start (shifted and
-  turned about z). Heights are not moved, because they are measured from the ground,
-  which keeps the box and platform heights right.
+- *Anchoring.* The reference is planned for the nominal scene, but in every attempt the
+  robot starts somewhere else and the box sits somewhere else. So the reference's
+  horizontal path is placed in the actual scene. At the start it begins where the robot
+  actually stands (shifted and turned to its start position and heading). From the
+  landing on, it is placed relative to the actual landing target: the box for jump 1
+  (its position and rotation), the platform for jump 2 (it never moves). In between, it
+  blends smoothly from one to the other until the planned touch-down. The heading stays
+  the robot's own, and heights are not moved, because they are measured from the ground.
+  *Why:* the planned jump has little room on the box (rear feet 7 cm inside its front
+  edge, head 1 cm from the platform face). Shifting the whole jump with the start, which
+  varies by up to 15 cm, would ask the robot to land off the box or into the platform.
 - *One observation function.* The observation is built by one Isaac-free function,
   used both in training and by the skill that runs the policy, so the two always match.
 - *Placeholder.* Until the real references exist, `make_placeholder_reference.py`

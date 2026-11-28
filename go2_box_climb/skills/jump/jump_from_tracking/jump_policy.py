@@ -23,7 +23,7 @@ from go2_box_climb.utils.runs import REPO_ROOT
 
 from .jump_math import yaw_of
 from .observation import OBS_DIM, jump_observation
-from .reference import JUMPS, check_jump, load_reference
+from .reference import JUMPS, Anchor, check_jump, load_reference, target_anchor
 
 #: Released policies (committed to git once trained), one per jump.
 POLICY_DIR = REPO_ROOT / "policies" / "jump_from_tracking"
@@ -82,16 +82,19 @@ class JumpTrackingPolicy:
         in_dim = next(p.shape[1] for p in self.net.parameters() if p.dim() == 2)
         if in_dim != OBS_DIM:
             raise ValueError(f"{self.policy_file} expects {in_dim} inputs; the jump observation has {OBS_DIM}.")
-        self.start_xy = torch.zeros(1, 2, device=device)
-        self.start_yaw = torch.zeros(1, device=device)
+        z2, z1 = torch.zeros(1, 2, device=device), torch.zeros(1, device=device)
+        self.anchor = Anchor(start_xy=z2, start_yaw=z1, target_xy=z2.clone(), target_yaw=z1.clone())  # set by reset()
         self.start_time = 0.0
         self.last_action = torch.zeros(1, C.NUM_JOINTS, device=device)
 
     def reset(self, state: TaskState) -> None:
-        """Call when the jump starts: the current pose becomes the reference's start."""
+        """Call when the jump starts: the current pose becomes the reference's start, and the box
+        pose (jump 1) the landing target (reference.py, "Anchoring")."""
         s = state_tensors(state, self.device)
-        self.start_xy = s["base_pos"][:, :2].clone()
-        self.start_yaw = yaw_of(s["base_quat"])
+        target_xy, target_yaw = target_anchor(self.jump, s["box_pos"], s["box_quat"])
+        self.anchor = Anchor(
+            start_xy=s["base_pos"][:, :2].clone(), start_yaw=yaw_of(s["base_quat"]), target_xy=target_xy, target_yaw=target_yaw
+        )
         self.start_time = float(state.time)
         self.last_action = torch.zeros(1, C.NUM_JOINTS, device=self.device)
         if hasattr(self.net, "reset"):  # recurrent policies; ours is a plain MLP
@@ -107,8 +110,7 @@ class JumpTrackingPolicy:
         return jump_observation(
             track=self.track,
             time=torch.tensor([self.elapsed(state)], dtype=torch.float32, device=self.device),
-            start_xy=self.start_xy,
-            start_yaw=self.start_yaw,
+            anchor=self.anchor,
             last_action=self.last_action,
             **s,
         )

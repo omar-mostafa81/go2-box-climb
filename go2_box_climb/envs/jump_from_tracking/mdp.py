@@ -32,7 +32,7 @@ from go2_box_climb.skills.jump.jump_from_tracking.checks import (
 )
 from go2_box_climb.skills.jump.jump_from_tracking.jump_math import quat_angle
 from go2_box_climb.skills.jump.jump_from_tracking.observation import jump_observation
-from go2_box_climb.skills.jump.jump_from_tracking.reference import ReferenceSample, load_reference
+from go2_box_climb.skills.jump.jump_from_tracking.reference import Anchor, ReferenceSample, load_reference
 from go2_box_climb.skills.jump.jump_from_tracking.start import sample_start
 
 FEET = ("FL_foot", "FR_foot", "RL_foot", "RR_foot")  # same order as common/formats.py FEET
@@ -53,7 +53,8 @@ class JumpReferenceCommand(CommandTerm):
     ``command`` is the phase (time / reference duration), one number per env.
     Each reset (= each new jump attempt) draws new start conditions for the box and the
     robot (skills/jump/jump_from_tracking/start.py, ranges from common/constants.py),
-    puts them into the simulation, and anchors the reference to the robot's start.
+    puts them into the simulation, and places the reference from the robot's start to the
+    actual landing target (reference.py, "Anchoring").
     """
 
     cfg: "JumpReferenceCommandCfg"
@@ -64,8 +65,11 @@ class JumpReferenceCommand(CommandTerm):
         self.box = env.scene[cfg.box_name]
         self.track = load_reference(cfg.jump, cfg.reference_path, device=self.device)
         n = self.num_envs
+        # where the reference is placed in each env's current attempt (reference.py, "Anchoring")
         self.start_xy = torch.zeros(n, 2, device=self.device)
         self.start_yaw = torch.zeros(n, device=self.device)
+        self.target_xy = torch.zeros(n, 2, device=self.device)
+        self.target_yaw = torch.zeros(n, device=self.device)
         # start conditions of the current attempt (env frame), kept for the evaluation logs
         self.box_gap = torch.zeros(n, device=self.device)
         self.box_offset_y = torch.zeros(n, device=self.device)
@@ -86,9 +90,13 @@ class JumpReferenceCommand(CommandTerm):
         """(N,) reference time of each env [s] (see the module docstring)."""
         return self._env.episode_length_buf.float() * self._env.step_dt
 
+    @property
+    def anchor(self) -> Anchor:
+        return Anchor(self.start_xy, self.start_yaw, self.target_xy, self.target_yaw)
+
     def targets(self, lookahead: float = 0.0) -> ReferenceSample:
         """Anchored reference values at time() + lookahead (env frame)."""
-        return self.track.at_anchored(self.time() + lookahead, self.start_xy, self.start_yaw)
+        return self.track.at_anchored(self.time() + lookahead, self.anchor)
 
     @property
     def command(self) -> torch.Tensor:
@@ -116,9 +124,11 @@ class JumpReferenceCommand(CommandTerm):
         # hold the start pose until the first action arrives
         self.robot.set_joint_position_target_index(target=s.joint_pos, env_ids=ids)
 
-        # the reference is anchored to this start
-        self.start_xy[ids] = s.robot_pos[:, :2]
-        self.start_yaw[ids] = s.robot_yaw
+        # the reference is placed for this attempt: from the robot's start to the actual landing target
+        self.start_xy[ids] = s.anchor.start_xy
+        self.start_yaw[ids] = s.anchor.start_yaw
+        self.target_xy[ids] = s.anchor.target_xy
+        self.target_yaw[ids] = s.anchor.target_yaw
         self.box_gap[ids], self.box_offset_y[ids], self.box_yaw[ids] = s.box_gap, s.box_offset_y, s.box_yaw
         self.start_distance[ids] = s.start_distance
 
@@ -171,8 +181,7 @@ def jump_obs(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     return jump_observation(
         track=cmd.track,
         time=cmd.time(),
-        start_xy=cmd.start_xy,
-        start_yaw=cmd.start_yaw,
+        anchor=cmd.anchor,
         base_pos=_t(robot.data.root_pos_w) - origins,
         base_quat=_t(robot.data.root_quat_w),
         base_lin_vel=_t(robot.data.root_lin_vel_w),

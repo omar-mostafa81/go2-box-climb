@@ -10,12 +10,23 @@ re-normalized; foot contacts are taken from the nearest sample). Before the star
 it returns the first sample, after the end the last one (the robot should stand
 still in the final pose).
 
-Anchoring. The reference is planned for the nominal start. At every start the robot
-stands somewhere else (random distance and heading, see common/constants.py), so
-the reference's horizontal motion and heading are moved onto the robot's actual
-start: positions are shifted and rotated about z so that the reference starts at
-the robot's start position and heading. Heights are NOT shifted: they are measured
-from the ground, so the box and platform heights stay correct.
+Anchoring. The reference is planned for the nominal scene: robot at the nominal start,
+box flush against the platform. In every attempt the robot starts somewhere else and
+the box is somewhere else (random ranges in common/constants.py), so the reference's
+horizontal path is moved onto the actual scene (``Anchor``):
+    * at the start it begins where the robot actually stands (shifted and turned about z
+      to the robot's start position and heading),
+    * from the landing on, it is placed relative to the actual landing target: the box
+      for ground_to_box (position and rotation of the box), the platform for
+      box_to_platform (fixed, so the planned landing spot itself),
+    * in between it blends smoothly from the first to the second (smoothstep in
+      time / landing time, where the landing time is the first touch-down after the
+      flight, found from the foot contacts).
+The heading stays the robot's own start heading (shifted like the start). Heights are
+NOT shifted: they are measured from the ground, so the box and platform heights stay
+correct. Why: the planned jump has little room on the box (rear feet 7 cm inside its
+front edge, head 1 cm from the platform face), so shifting the whole jump with the
+start (up to 15 cm) would ask the robot to land off the box or into the platform.
 
 Placeholder. Until the TO member delivers the real files, ``placeholder_reference``
 makes a simple, smooth, kinematically plausible jump in the same format (feet on the
@@ -77,10 +88,58 @@ class ReferenceSample:
     foot_contact: torch.Tensor  # (N, 4) 1.0 = foot on a surface, FEET order
 
 
+@dataclass
+class Anchor:
+    """Where the reference is placed in one attempt (batch of N, env frame; see "Anchoring")."""
+
+    start_xy: torch.Tensor  # (N, 2) robot base position at the start [m]
+    start_yaw: torch.Tensor  # (N,) robot heading at the start [rad]
+    target_xy: torch.Tensor  # (N, 2) actual position of the landing target's reference point [m]
+    target_yaw: torch.Tensor  # (N,) actual rotation of the landing target [rad]
+
+
+def nominal_target(jump: str) -> tuple[float, float]:
+    """Reference point of the landing target in the nominal scene (env frame) [m].
+
+    ground_to_box: the box center at the push target (BOX_TARGET_POS).
+    box_to_platform: the middle of the platform's front edge (the platform never moves).
+    """
+    check_jump(jump)
+    if jump == "ground_to_box":
+        return (C.BOX_TARGET_POS[0], C.BOX_TARGET_POS[1])
+    return (C.PLATFORM_FRONT_X, C.PLATFORM_POS[1])
+
+
+def target_anchor(jump: str, box_pos: torch.Tensor, box_quat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Actual position (N, 2) and rotation (N,) of the landing target, from the box pose at the start."""
+    if check_jump(jump) == "ground_to_box":
+        return box_pos[:, :2].clone(), yaw_of(box_quat)
+    n = box_pos.shape[0]
+    xy = torch.tensor(nominal_target(jump), dtype=box_pos.dtype, device=box_pos.device).expand(n, 2).clone()
+    return xy, torch.zeros(n, dtype=box_pos.dtype, device=box_pos.device)
+
+
+def landing_time(t: np.ndarray, foot_contact: np.ndarray) -> float:
+    """First time after the flight when all feet touch a surface again [s] (end time if there is no flight)."""
+    airborne = ~np.asarray(foot_contact, dtype=bool).any(axis=1)
+    if not airborne.any():
+        return float(t[-1])
+    first_air = int(np.argmax(airborne))
+    down = np.asarray(foot_contact, dtype=bool).all(axis=1)
+    after = np.nonzero(down[first_air:])[0]
+    return float(t[first_air + after[0]]) if len(after) else float(t[-1])
+
+
+def _rotate_xy(yaw: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    c, s = torch.cos(yaw), torch.sin(yaw)
+    return torch.stack((c * v[:, 0] - s * v[:, 1], s * v[:, 0] + c * v[:, 1]), dim=-1)
+
+
 class ReferenceTrack:
     """A JumpReference as torch tensors, looked up by time."""
 
-    def __init__(self, ref: JumpReference, device: str | torch.device = "cpu"):
+    def __init__(self, ref: JumpReference, device: str | torch.device = "cpu", jump: str | None = None):
+        """``jump`` sets the nominal landing target (``nominal_target``); without it the target point is (0, 0)."""
         t = np.asarray(ref.t, dtype=np.float64)
         if t.ndim != 1 or len(t) < 2:
             raise ValueError("A jump reference needs at least 2 time samples.")
@@ -110,6 +169,8 @@ class ReferenceTrack:
         self.num_samples = len(t)
         self.start_pos = self.base_pos[0]  # (3,)
         self.start_yaw = yaw_of(self.base_quat[0])  # scalar tensor
+        self.landing_time = landing_time(t, ref.foot_contact)
+        self.target_xy_nominal = torch.tensor(nominal_target(jump) if jump else (0.0, 0.0), device=device)
 
     def at(self, time: torch.Tensor) -> ReferenceSample:
         """Reference values at times ``time`` (N,) [s], as planned (nominal start)."""
@@ -126,27 +187,33 @@ class ReferenceTrack:
         contact = torch.where(a < 0.5, self.foot_contact[idx], self.foot_contact[idx + 1])
         return ReferenceSample(lerp(self.base_pos), quat, lerp(self.joint_pos), contact)
 
-    def at_anchored(self, time: torch.Tensor, start_xy: torch.Tensor, start_yaw: torch.Tensor) -> ReferenceSample:
-        """Reference values moved onto the robot's actual start (see "Anchoring" above).
+    def blend(self, time: torch.Tensor) -> torch.Tensor:
+        """(N,) weight of the target anchor: 0 at the start, smoothly up to 1 at the landing time."""
+        t_land = max(self.landing_time, 1e-6)
+        x = (torch.as_tensor(time, dtype=torch.float32, device=self.device).reshape(-1) / t_land).clamp(0, 1)
+        return x * x * (3 - 2 * x)
+
+    def at_anchored(self, time: torch.Tensor, anchor: Anchor) -> ReferenceSample:
+        """Reference values placed in the actual scene (see "Anchoring" above).
 
         Args:
             time: (N,) time since the jump started [s].
-            start_xy: (N, 2) the robot's base position at the start (env frame) [m].
-            start_yaw: (N,) the robot's heading at the start [rad].
+            anchor: the robot's start and the landing target's actual pose (env frame).
         """
         s = self.at(time)
-        dyaw = start_yaw - self.start_yaw
-        c, si = torch.cos(dyaw), torch.sin(dyaw)
-        rel = s.base_pos[:, :2] - self.start_pos[:2]
-        xy = start_xy + torch.stack((c * rel[:, 0] - si * rel[:, 1], si * rel[:, 0] + c * rel[:, 1]), dim=-1)
-        pos = torch.cat((xy, s.base_pos[:, 2:3]), dim=-1)
+        p = s.base_pos[:, :2]
+        dyaw = anchor.start_yaw - self.start_yaw
+        from_start = anchor.start_xy + _rotate_xy(dyaw, p - self.start_pos[:2])
+        from_target = anchor.target_xy + _rotate_xy(anchor.target_yaw, p - self.target_xy_nominal)
+        w = self.blend(time).unsqueeze(-1)
+        pos = torch.cat(((1 - w) * from_start + w * from_target, s.base_pos[:, 2:3]), dim=-1)
         quat = quat_mul(quat_from_yaw(dyaw), s.base_quat)
         return ReferenceSample(pos, quat, s.joint_pos, s.foot_contact)
 
 
 def load_reference(jump: str, path: str | Path | None = None, device: str | torch.device = "cpu") -> ReferenceTrack:
     """Load the reference of ``jump`` (from ``path``, or the final file in references/)."""
-    return ReferenceTrack(JumpReference.load(str(reference_file(jump, path))), device=device)
+    return ReferenceTrack(JumpReference.load(str(reference_file(jump, path))), device=device, jump=jump)
 
 
 # =============================================================================

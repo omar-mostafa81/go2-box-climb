@@ -28,7 +28,7 @@ import torch
 from go2_box_climb.common import constants as C
 
 from .jump_math import quat_from_yaw, quat_mul, quat_rotate
-from .reference import ReferenceTrack, check_jump
+from .reference import Anchor, ReferenceTrack, check_jump, target_anchor
 
 
 @dataclass
@@ -43,6 +43,7 @@ class StartConditions:
     robot_yaw: torch.Tensor  # (N,) heading [rad] (relative to +x)
     joint_pos: torch.Tensor  # (N, 12) the reference's first joint angles
     start_distance: torch.Tensor  # (N,) ground_to_box: base behind the box face [m] (0 for box_to_platform)
+    anchor: Anchor  # where the reference is placed in this attempt (reference.py, "Anchoring")
 
 
 def _u(n: int, lo_hi, device) -> torch.Tensor:
@@ -81,6 +82,7 @@ def sample_start(jump: str, track: ReferenceTrack, n: int, device: str | torch.d
         yaw = box_yaw + yaw  # heading relative to the box (see the module docstring)
     robot_pos[:, 2] = ref0.base_pos[:, 2]
     robot_quat = quat_mul(quat_from_yaw(yaw - track.start_yaw), ref0.base_quat)
+    target_xy, target_yaw = target_anchor(jump, box_pos, box_quat)
     return StartConditions(
         box_pos=box_pos,
         box_quat=box_quat,
@@ -92,4 +94,5 @@ def sample_start(jump: str, track: ReferenceTrack, n: int, device: str | torch.d
         robot_yaw=yaw,
         joint_pos=ref0.joint_pos,
         start_distance=distance,
+        anchor=Anchor(start_xy=robot_pos[:, :2].clone(), start_yaw=yaw, target_xy=target_xy, target_yaw=target_yaw),
     )

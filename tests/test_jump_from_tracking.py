@@ -24,9 +24,12 @@ from go2_box_climb.skills.jump.jump_from_tracking.kinematics import foot_positio
 from go2_box_climb.skills.jump.jump_from_tracking.observation import OBS_DIM, OBS_SLICES, jump_observation
 from go2_box_climb.skills.jump.jump_from_tracking.reference import (
     JUMPS,
+    Anchor,
     ReferenceTrack,
     jump_surfaces,
+    nominal_target,
     placeholder_reference,
+    target_anchor,
 )
 from go2_box_climb.skills.jump.jump_from_tracking.start import box_half_extent_x, sample_start
 
@@ -97,14 +100,39 @@ def test_reference_must_be_valid():
 
 
 def test_reference_anchoring():
-    track = ReferenceTrack(_simple_reference())
-    start_xy, start_yaw = torch.tensor([[1.0, 2.0]]), torch.tensor([math.pi / 2])
-    s0 = track.at_anchored(torch.tensor([0.0]), start_xy, start_yaw)
+    track = ReferenceTrack(_simple_reference())  # no jump given: nominal target point (0, 0)
+    assert track.landing_time == pytest.approx(0.2)  # airborne at 0.1 s, all feet down again at 0.2 s
+    # robot starts at (1, 2) facing +y; the landing target is at (5, 5), not rotated
+    anchor = Anchor(
+        start_xy=torch.tensor([[1.0, 2.0]]), start_yaw=torch.tensor([math.pi / 2]),
+        target_xy=torch.tensor([[5.0, 5.0]]), target_yaw=torch.tensor([0.0]),
+    )  # fmt: skip
+    s0 = track.at_anchored(torch.tensor([0.0]), anchor)  # start: where the robot stands, its heading
     assert torch.allclose(s0.base_pos, torch.tensor([[1.0, 2.0, 0.3]]), atol=1e-6)
     assert M.yaw_of(s0.base_quat).item() == pytest.approx(math.pi / 2, abs=1e-6)
-    # the reference moves 0.2 m forward; the robot faces +y, so it moves 0.2 m along +y
-    s1 = track.at_anchored(torch.tensor([0.2]), start_xy, start_yaw)
-    assert torch.allclose(s1.base_pos, torch.tensor([[1.0, 2.2, 0.3]]), atol=1e-6)
+    # landing: placed relative to the target (planned 0.2 m from the nominal target point)
+    s2 = track.at_anchored(torch.tensor([0.2]), anchor)
+    assert torch.allclose(s2.base_pos, torch.tensor([[5.2, 5.0, 0.3]]), atol=1e-6)
+    # half way to the landing: half from the start-anchored path (1, 2.1), half from the target one (5.1, 5)
+    s1 = track.at_anchored(torch.tensor([0.1]), anchor)
+    assert torch.allclose(s1.base_pos, torch.tensor([[3.05, 3.55, 0.4]]), atol=1e-5)
+    # heading stays the robot's own all the way
+    assert M.yaw_of(s2.base_quat).item() == pytest.approx(math.pi / 2, abs=1e-6)
+
+
+def test_target_anchor():
+    box_pos, box_quat = torch.tensor([[1.6, 0.1, 0.125]]), _yaw_quat(0.2)
+    xy, yaw = target_anchor("ground_to_box", box_pos, box_quat)  # jump 1 lands relative to the actual box
+    assert torch.allclose(xy, box_pos[:, :2]) and yaw.item() == pytest.approx(0.2, abs=1e-6)
+    xy, yaw = target_anchor("box_to_platform", box_pos, box_quat)  # jump 2: the platform never moves
+    assert torch.allclose(xy, torch.tensor([nominal_target("box_to_platform")])) and yaw.item() == 0.0
+    # with the box exactly at its nominal place, target anchoring changes nothing at the landing
+    track = ReferenceTrack(placeholder_reference("ground_to_box"), jump="ground_to_box")
+    ref0 = track.at(torch.zeros(1))
+    nominal = Anchor(ref0.base_pos[:, :2], M.yaw_of(ref0.base_quat), torch.tensor([nominal_target("ground_to_box")]),
+                     torch.zeros(1))  # fmt: skip
+    end = torch.tensor([track.duration])
+    assert torch.allclose(track.at_anchored(end, nominal).base_pos, track.at(end).base_pos, atol=1e-6)
 
 
 # --- kinematics ---------------------------------------------------------------------
@@ -161,6 +189,10 @@ def test_start_conditions(jump):
     assert (heading.abs() <= C.JUMP_START_YAW[1] + 1e-6).all()
     assert torch.allclose(M.yaw_of(s.robot_quat), s.robot_yaw, atol=1e-5)
     assert torch.allclose(s.robot_pos[:, 2], track.base_pos[0, 2].expand(512))
+    # the reference is placed from the robot's start to the actual landing target
+    assert torch.allclose(s.anchor.start_xy, s.robot_pos[:, :2]) and torch.allclose(s.anchor.start_yaw, s.robot_yaw)
+    target_xy, target_yaw = target_anchor(jump, s.box_pos, s.box_quat)
+    assert torch.allclose(s.anchor.target_xy, target_xy) and torch.allclose(s.anchor.target_yaw, target_yaw)
     if jump == "ground_to_box":
         face_x = s.box_pos[:, 0] - C.BOX_SIZE[0] / 2 * torch.cos(s.box_yaw)
         assert torch.allclose(face_x - s.robot_pos[:, 0], s.start_distance, atol=1e-5)
@@ -203,15 +235,17 @@ def test_observation_layout():
     assert covered[0][0] == 0 and covered[-1][1] == OBS_DIM
     assert all(a[1] == b[0] for a, b in zip(covered, covered[1:]))  # no gaps, no overlaps
 
-    track = ReferenceTrack(placeholder_reference("ground_to_box"))
+    track = ReferenceTrack(placeholder_reference("ground_to_box"), jump="ground_to_box")
     ref0 = track.at(torch.zeros(1))
     zeros3, zeros12 = torch.zeros(1, 3), torch.zeros(1, 12)
     box = torch.tensor([C.BOX_TARGET_POS])
 
     def obs(yaw: float) -> torch.Tensor:
         q = M.quat_mul(_yaw_quat(yaw), ref0.base_quat)
+        target_xy, target_yaw = target_anchor("ground_to_box", box, IDENTITY)
+        anchor = Anchor(ref0.base_pos[:, :2], M.yaw_of(q), target_xy, target_yaw)
         return jump_observation(
-            track=track, time=torch.zeros(1), start_xy=ref0.base_pos[:, :2], start_yaw=M.yaw_of(q),
+            track=track, time=torch.zeros(1), anchor=anchor,
             base_pos=ref0.base_pos, base_quat=q, base_lin_vel=zeros3, base_ang_vel=zeros3,
             joint_pos=ref0.joint_pos, joint_vel=zeros12, last_action=zeros12, box_pos=box, box_quat=IDENTITY,
         )[0]  # fmt: skip
