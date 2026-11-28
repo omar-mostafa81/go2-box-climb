@@ -277,7 +277,9 @@ class JumpSuccess(ManagerTermBase):
         box_pos = _t(self.box.data.root_pos_w) - origins
         on = feet_on_target(jump, feet, box_pos, _t(self.box.data.root_quat_w), self.foot_radius)
         ok = success_now(_t(self.robot.data.root_quat_w), _t(self.robot.data.root_lin_vel_w), on, min_feet)
-        self.ok_steps = torch.where(ok, self.ok_steps + 1, torch.zeros_like(self.ok_steps))
+        # count in place (+1 if ok, back to 0 if not): a new tensor made under torch.inference_mode
+        # (play.py / eval.py) could not be reset later outside it
+        self.ok_steps.add_(1).mul_(ok.long())
         return self.ok_steps >= self.needed
 
 
