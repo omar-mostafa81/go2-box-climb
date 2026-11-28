@@ -31,7 +31,12 @@ from go2_box_climb.skills.jump.jump_from_tracking.reference import (
     placeholder_reference,
     target_anchor,
 )
-from go2_box_climb.skills.jump.jump_from_tracking.start import box_half_extent_x, sample_start
+from go2_box_climb.skills.jump.jump_from_tracking.start import (
+    box_half_extent_x,
+    reference_start_distance,
+    reference_state,
+    sample_start,
+)
 
 IDENTITY = torch.tensor([[0.0, 0.0, 0.0, 1.0]])
 
@@ -201,6 +206,31 @@ def test_start_conditions(jump):
         feet = foot_positions(s.robot_pos, s.robot_quat, s.joint_pos)
         on_box = feet_on_target("ground_to_box", feet, s.box_pos, s.box_quat, go2_geometry().foot_radius)
         assert on_box.all()
+
+
+def test_start_conditions_curriculum():
+    track = ReferenceTrack(placeholder_reference("ground_to_box"), jump="ground_to_box")
+    s = sample_start("ground_to_box", track, 64, scale=0.0)  # nominal: box flush, centered, square
+    assert torch.allclose(s.box_gap, torch.zeros(64)) and torch.allclose(s.box_offset_y, torch.zeros(64))
+    assert torch.allclose(s.box_yaw, torch.zeros(64)) and torch.allclose(s.robot_yaw, torch.zeros(64))
+    assert torch.allclose(s.start_distance, torch.full((64,), reference_start_distance(track)))
+    assert torch.allclose(s.robot_pos[:, :2], track.base_pos[0, :2].expand(64, 2), atol=1e-5)  # the planned start
+    half = sample_start("ground_to_box", track, 512, scale=0.5)
+    assert (half.box_gap <= C.BOX_GAP_RANGE[1] / 2 + 1e-6).all()
+
+
+def test_reference_state():
+    track = ReferenceTrack(_simple_reference())
+    zeros2, zero = torch.zeros(1, 2), torch.zeros(1)
+    identity = Anchor(zeros2, zero, zeros2.clone(), zero.clone())  # places the reference exactly as planned
+    s = reference_state(track, identity, torch.tensor([0.05]))
+    # the reference moves 0.1 m forward and up in 0.1 s, joints 0 -> 1 rad in 0.1 s
+    assert torch.allclose(s.lin_vel, torch.tensor([[1.0, 0.0, 1.0]]), atol=1e-4)
+    assert torch.allclose(s.joint_vel, torch.full((1, 12), 10.0), atol=1e-3)
+    assert torch.allclose(s.ang_vel, torch.zeros(1, 3), atol=1e-6)
+    assert torch.allclose(s.base_pos, track.at(torch.tensor([0.05])).base_pos, atol=1e-6)
+    still = reference_state(track, identity, torch.tensor([0.0]))  # a normal start: standing still
+    assert still.lin_vel.abs().max() == 0 and still.joint_vel.abs().max() == 0
 
 
 # --- success / fall checks -----------------------------------------------------------------

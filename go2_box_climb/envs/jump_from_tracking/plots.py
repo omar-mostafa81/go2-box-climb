@@ -20,8 +20,10 @@ JUMP_PANELS = [
             "Episode_Termination/fall_contact",
             "Episode_Termination/fall_tilt",
             "Episode_Termination/time_out",
+            "Episode_Termination/far_from_reference",
         ],
     ),
+    ("Start/box randomization in use (0 = nominal, 1 = full)", ["Metrics/jump_reference/randomization"]),
     ("Joint tracking error [rad] (per step, mean over the attempt)", ["Metrics/jump_reference/error_joint_pos"]),
     ("Base position tracking error [m]", ["Metrics/jump_reference/error_base_pos"]),
     ("Mean episode length [steps] (max 150 = 3 s)", ["Train/mean_episode_length"]),
@@ -35,7 +37,7 @@ def plot_jump_run(run_dir) -> Path | None:
     panels = [p for p in JUMP_PANELS if any(t in data for t in p[1])]
     if not panels:
         return None
-    fig = Figure(figsize=(6 * len(panels), 4.2))
+    fig = Figure(figsize=(5 * len(panels), 4.2))
     fig.suptitle(f"{run_dir.name}: jump attempts")
     for i, (name, tags) in enumerate(panels):
         ax = fig.add_subplot(1, len(panels), i + 1)

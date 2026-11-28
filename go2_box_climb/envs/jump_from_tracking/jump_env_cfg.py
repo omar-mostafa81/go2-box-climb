@@ -8,10 +8,18 @@ conditions (see mdp.JumpReferenceCommand).
 
     observation   77 numbers (skills/jump/jump_from_tracking/observation.py)
     action        12 joint targets: DEFAULT_JOINT_POS + ACTION_SCALE * action (PD, shared contract)
-    rewards       follow the reference (joints, base height / position / orientation, foot
-                  contacts) + success bonus - fall penalty - effort and smoothness penalties
+    rewards       follow the reference (base height / position / orientation, joints, foot
+                  contacts) + feet on the target after the planned landing + success bonus
+                  - fall penalty - effort and smoothness penalties
     episode end   success (held JUMP_SUCCESS_SETTLE_S), fall (trunk/head contact or tilt
                   > JUMP_MAX_TILT), or JUMP_TIME_LIMIT_S
+
+Training aids (switched off by ``eval_mode()``, which play.py and eval.py use, so the
+policy is judged with the shared jump rules only):
+    * early stop when the base is more than FAR_FROM_REFERENCE_M from the reference
+    * RSI_PROB of the attempts start part-way through the jump (reference state initialization)
+    * curriculum: the start/box ranges grow from nominal to the full shared ranges between
+      RANDOMIZATION_RAMP_ITERATIONS
 """
 
 import isaaclab.envs.mdp as base_mdp
@@ -31,6 +39,7 @@ from go2_box_climb.envs.scene.box_climb_scene import BoxClimbSceneCfg
 from go2_box_climb.skills.jump.jump_from_tracking.reference import check_jump
 
 from . import mdp
+from .agents import STEPS_PER_ITERATION
 
 COMMAND = "jump_reference"  # name of the command term that holds the reference
 
@@ -38,12 +47,15 @@ COMMAND = "jump_reference"  # name of the command term that holds the reference
 # Isaac Lab multiplies every term by the policy step (0.02 s). Tracking terms are in [0, 1]
 # per step, so a weight w gives at most w per second of good tracking; the success bonus and
 # fall penalty happen once, so their weights are large (250 * 0.02 = 5 once).
+# The body's path is weighted above the joint angles: copying the leg motion alone (without
+# leaving the ground) must not pay off.
 WEIGHTS = {
-    "track_joint_pos": 2.0,
-    "track_base_height": 1.0,
-    "track_base_xy": 1.0,
+    "track_base_height": 2.0,
+    "track_base_xy": 2.0,
     "track_base_orientation": 1.0,
+    "track_joint_pos": 1.0,
     "track_foot_contact": 0.5,
+    "feet_on_target": 1.0,  # per step, from the planned landing on
     "success": 250.0,
     "fall": -250.0,
     "action_rate": -0.01,
@@ -51,15 +63,23 @@ WEIGHTS = {
     "joint_acc": -2.5e-7,
     "joint_pos_limits": -5.0,
 }
-# Widths of the exp(-error^2 / std^2) tracking rewards
+# Widths of the exp(-error^2 / std^2) tracking rewards: wide enough that being closer to the
+# planned path is still rewarded when the robot is far from it
 TRACK_STD = {
+    "base_height": 0.15,  # [m]
+    "base_xy": 0.3,  # [m]
+    "base_orientation": 0.4,  # [rad]
     "joint_pos": 0.6,  # [rad], over the sum of the 12 squared joint errors
-    "base_height": 0.05,  # [m]
-    "base_xy": 0.15,  # [m] (looser: the robot may shift its landing to the actual box)
-    "base_orientation": 0.3,  # [rad]
 }
 FOOT_CONTACT_FORCE = 1.0  # [N] a foot counts as touching above this force
 FEET_SENSOR = SceneEntityCfg("contact_forces", body_names=list(mdp.FEET), preserve_order=True)
+FEET_BODIES = SceneEntityCfg("robot", body_names=list(mdp.FEET), preserve_order=True)
+
+# ---- Training aids (see the module docstring) ------------------------------------------
+FAR_FROM_REFERENCE_M = 0.3  # early stop when the base is farther than this from the reference [m]
+RSI_PROB = 0.5  # share of attempts that start part-way through the jump
+RANDOMIZATION_RAMP_ITERATIONS = (200, 1000)  # start/box ranges: nominal before, full after
+BASE_MASS_RANGE = (1 / 1.1, 1.1)  # base mass scale (TO's MuJoCo check: the plan is sensitive to mass)
 
 
 @configclass
@@ -93,7 +113,7 @@ class ObservationsCfg:
 
 @configclass
 class EventsCfg:
-    # startup: foot/body friction 0.4-1.25 (as for walking) and base mass +-25 %
+    # startup: foot/body friction 0.4-1.25 (as for walking) and base mass (BASE_MASS_RANGE)
     physics_material = EventTerm(
         func=base_mdp.randomize_rigid_body_material,
         mode="startup",
@@ -111,7 +131,7 @@ class EventsCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names="base"),
-            "mass_distribution_params": (1 / 1.25, 1.25),
+            "mass_distribution_params": BASE_MASS_RANGE,
             "operation": "scale",
             "distribution": "log_uniform",
         },
@@ -146,6 +166,11 @@ class RewardsCfg:
         weight=WEIGHTS["track_foot_contact"],
         params={"command_name": COMMAND, "sensor_cfg": FEET_SENSOR, "threshold": FOOT_CONTACT_FORCE},
     )
+    feet_on_target = RewTerm(
+        func=mdp.feet_on_target_after_landing,
+        weight=WEIGHTS["feet_on_target"],
+        params={"command_name": COMMAND, "asset_cfg": FEET_BODIES},
+    )
     success = RewTerm(func=base_mdp.is_terminated_term, weight=WEIGHTS["success"], params={"term_keys": "success"})
     fall = RewTerm(
         func=base_mdp.is_terminated_term, weight=WEIGHTS["fall"], params={"term_keys": ["fall_contact", "fall_tilt"]}
@@ -168,6 +193,10 @@ class TerminationsCfg:
     )
     fall_tilt = DoneTerm(func=base_mdp.bad_orientation, params={"limit_angle": float(C.JUMP_MAX_TILT)})
     success = DoneTerm(func=mdp.JumpSuccess, params={"jump": "ground_to_box"})
+    # training only (removed by eval_mode)
+    far_from_reference = DoneTerm(
+        func=mdp.far_from_reference, params={"command_name": COMMAND, "max_distance": FAR_FROM_REFERENCE_M}
+    )
 
 
 @configclass
@@ -192,6 +221,11 @@ class JumpTrackEnvCfg(ManagerBasedRLEnvCfg):
         self.scene.contact_forces.update_period = C.SIM_DT
         # --- One jump attempt per episode ---
         self.episode_length_s = C.JUMP_TIME_LIMIT_S
+        # --- Training aids (eval_mode switches them off) ---
+        self.commands.jump_reference.rsi_prob = RSI_PROB
+        self.commands.jump_reference.randomization_ramp_steps = tuple(
+            i * STEPS_PER_ITERATION for i in RANDOMIZATION_RAMP_ITERATIONS
+        )
         # --- Camera (gui / stream / --video): side view of robot 0 ---
         self.viewer.origin_type = "asset_root"
         self.viewer.asset_name = "robot"
@@ -207,7 +241,16 @@ class JumpTrackEnvCfg(ManagerBasedRLEnvCfg):
         self.terminations.success.params["jump"] = jump
         return self
 
+    def eval_mode(self) -> "JumpTrackEnvCfg":
+        """Judge with the shared jump rules only (eval.py, play.py): no early stop on drifting from the
+        reference, every attempt from the start, full start/box ranges."""
+        self.terminations.far_from_reference = None
+        self.commands.jump_reference.rsi_prob = 0.0
+        self.commands.jump_reference.randomization_ramp_steps = None
+        return self
+
     def play_mode(self):
-        """Fewer robots for watching (used by play.py)."""
+        """Fewer robots for watching (used by play.py), under evaluation conditions."""
         super().play_mode()
+        self.eval_mode()
         self.scene.num_envs = 16

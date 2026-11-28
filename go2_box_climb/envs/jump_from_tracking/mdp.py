@@ -33,7 +33,9 @@ from go2_box_climb.skills.jump.jump_from_tracking.checks import (
 from go2_box_climb.skills.jump.jump_from_tracking.jump_math import quat_angle
 from go2_box_climb.skills.jump.jump_from_tracking.observation import jump_observation
 from go2_box_climb.skills.jump.jump_from_tracking.reference import Anchor, ReferenceSample, load_reference
-from go2_box_climb.skills.jump.jump_from_tracking.start import sample_start
+from go2_box_climb.skills.jump.jump_from_tracking.start import reference_state, sample_start
+
+FOOT_RADIUS = go2_geometry().foot_radius  # [m], from the Go2 USD (rule 13)
 
 FEET = ("FL_foot", "FR_foot", "RL_foot", "RR_foot")  # same order as common/formats.py FEET
 
@@ -75,8 +77,11 @@ class JumpReferenceCommand(CommandTerm):
         self.box_offset_y = torch.zeros(n, device=self.device)
         self.box_yaw = torch.zeros(n, device=self.device)
         self.start_distance = torch.zeros(n, device=self.device)
+        # reference time at which the current attempt started (> 0: started part-way, training only)
+        self.t0 = torch.zeros(n, device=self.device)
         self.metrics["error_joint_pos"] = torch.zeros(n, device=self.device)
         self.metrics["error_base_pos"] = torch.zeros(n, device=self.device)
+        self.metrics["randomization"] = torch.zeros(n, device=self.device)  # curriculum scale (0..1) in use
 
     def __str__(self) -> str:
         return (
@@ -87,8 +92,16 @@ class JumpReferenceCommand(CommandTerm):
     # --- reference time and targets ---------------------------------------------
 
     def time(self) -> torch.Tensor:
-        """(N,) reference time of each env [s] (see the module docstring)."""
-        return self._env.episode_length_buf.float() * self._env.step_dt
+        """(N,) reference time of each env [s] (see the module docstring), plus the start time t0."""
+        return self._env.episode_length_buf.float() * self._env.step_dt + self.t0
+
+    def randomization_scale(self) -> float:
+        """Curriculum: 0 (nominal starts) before the ramp, growing linearly to 1 (full ranges) at its end."""
+        ramp = self.cfg.randomization_ramp_steps
+        if ramp is None:
+            return 1.0
+        start, end = ramp
+        return float(min(max((self._env.common_step_counter - start) / max(end - start, 1), 0.0), 1.0))
 
     @property
     def anchor(self) -> Anchor:
@@ -105,24 +118,39 @@ class JumpReferenceCommand(CommandTerm):
     # --- reset: start conditions --------------------------------------------------
 
     def _resample_command(self, env_ids: Sequence[int]):
-        """Called at every reset: draw new start conditions (start.py) and put robot and box there."""
+        """Called at every reset: draw new start conditions (start.py) and put robot and box there.
+
+        With probability ``rsi_prob`` the attempt starts part-way through the jump (reference
+        state initialization, training only): at a random reference time t0, in the reference's
+        state at t0 including its velocities, lifted by ``rsi_lift`` so it never starts inside
+        the box. The others start at t0 = 0, standing still in the reference's first pose.
+        """
         ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
         n = len(ids)
         if n == 0:
             return
-        s = sample_start(self.cfg.jump, self.track, n, self.device)
+        scale = self.randomization_scale()
+        s = sample_start(self.cfg.jump, self.track, n, self.device, scale=scale)
+        t0 = torch.zeros(n, device=self.device)
+        if self.cfg.rsi_prob > 0:
+            use = torch.rand(n, device=self.device) < self.cfg.rsi_prob
+            t0 = torch.where(use, torch.rand(n, device=self.device) * self.track.duration, t0)
+        st = reference_state(self.track, s.anchor, t0)
+        pos = st.base_pos.clone()
+        pos[:, 2] += (t0 > 0).float() * self.cfg.rsi_lift
+
         origins = self._env.scene.env_origins[ids]
         zeros6 = torch.zeros(n, 6, device=self.device)
         self.box.write_root_pose_to_sim_index(root_pose=torch.cat((s.box_pos + origins, s.box_quat), dim=-1), env_ids=ids)
         self.box.write_root_velocity_to_sim_index(root_velocity=zeros6, env_ids=ids)
-        self.robot.write_root_pose_to_sim_index(
-            root_pose=torch.cat((s.robot_pos + origins, s.robot_quat), dim=-1), env_ids=ids
-        )
-        self.robot.write_root_velocity_to_sim_index(root_velocity=zeros6, env_ids=ids)
-        self.robot.write_joint_position_to_sim_index(position=s.joint_pos, env_ids=ids)
-        self.robot.write_joint_velocity_to_sim_index(velocity=torch.zeros_like(s.joint_pos), env_ids=ids)
+        self.robot.write_root_pose_to_sim_index(root_pose=torch.cat((pos + origins, st.base_quat), dim=-1), env_ids=ids)
+        self.robot.write_root_velocity_to_sim_index(root_velocity=torch.cat((st.lin_vel, st.ang_vel), dim=-1), env_ids=ids)
+        self.robot.write_joint_position_to_sim_index(position=st.joint_pos, env_ids=ids)
+        self.robot.write_joint_velocity_to_sim_index(velocity=st.joint_vel, env_ids=ids)
         # hold the start pose until the first action arrives
-        self.robot.set_joint_position_target_index(target=s.joint_pos, env_ids=ids)
+        self.robot.set_joint_position_target_index(target=st.joint_pos, env_ids=ids)
+        self.t0[ids] = t0
+        self.metrics["randomization"][ids] = scale
 
         # the reference is placed for this attempt: from the robot's start to the actual landing target
         self.start_xy[ids] = s.anchor.start_xy
@@ -149,8 +177,8 @@ class JumpReferenceCommand(CommandTerm):
         # attempt lasted 0.5 s or 3 s. (episode_length_buf is set to 0 only after this reset.)
         ids = slice(None) if env_ids is None else torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
         steps = self._env.episode_length_buf[ids].float().clamp(min=1.0)
-        for value in self.metrics.values():
-            value[ids] = value[ids] / steps
+        for name in ("error_joint_pos", "error_base_pos"):  # ("randomization" is a value, not a sum)
+            self.metrics[name][ids] = self.metrics[name][ids] / steps
         return super().reset(env_ids)
 
 
@@ -162,6 +190,9 @@ class JumpReferenceCommandCfg(CommandTermCfg):
     jump: str = MISSING  # "ground_to_box" or "box_to_platform"
     reference_path: str | None = None  # None = the final file in references/
     resampling_time_range: tuple[float, float] = (1.0e9, 1.0e9)  # only at resets (each reset = new attempt)
+    rsi_prob: float = 0.0  # share of attempts that start part-way through the jump (training only)
+    rsi_lift: float = 0.02  # those are placed this much higher [m], so they never start inside the box
+    randomization_ramp_steps: tuple[int, int] | None = None  # curriculum (env steps); None = full ranges always
 
 
 def reference_term(env: ManagerBasedRLEnv, command_name: str) -> JumpReferenceCommand:
@@ -235,6 +266,34 @@ def track_foot_contact(
     f = _t(env.scene.sensors[sensor_cfg.name].data.net_forces_w)[:, sensor_cfg.body_ids, :]
     contact = (torch.linalg.norm(f, dim=-1) > threshold).float()
     return 1.0 - torch.mean(torch.abs(contact - ref.foot_contact), dim=-1)
+
+
+def feet_on_target_after_landing(env: ManagerBasedRLEnv, command_name: str, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Fraction of feet on the target surface (checks.py), counted only from the planned landing time on."""
+    cmd = reference_term(env, command_name)
+    origins = env.scene.env_origins
+    feet = _t(cmd.robot.data.body_pos_w)[:, asset_cfg.body_ids, :] - origins.unsqueeze(1)
+    box_pos = _t(cmd.box.data.root_pos_w) - origins
+    on = feet_on_target(cmd.cfg.jump, feet, box_pos, _t(cmd.box.data.root_quat_w), FOOT_RADIUS)
+    landed = (cmd.time() >= cmd.track.landing_time).float()
+    return on.float().mean(dim=-1) * landed
+
+
+# =============================================================================
+# Terminations
+# =============================================================================
+
+
+def far_from_reference(env: ManagerBasedRLEnv, command_name: str, max_distance: float) -> torch.Tensor:
+    """Training only: the base is more than ``max_distance`` [m] from the (anchored) reference.
+
+    Ends attempts that have given up on the jump (e.g. staying on the ground while the
+    reference is in the air), so imitating the leg motion alone is not rewarded for long.
+    Not used in evaluation, which judges with the shared jump rules only.
+    """
+    ref = reference_term(env, command_name).targets()
+    p = _t(env.scene["robot"].data.root_pos_w) - env.scene.env_origins
+    return torch.linalg.norm(p - ref.base_pos, dim=-1) > max_distance
 
 
 # =============================================================================

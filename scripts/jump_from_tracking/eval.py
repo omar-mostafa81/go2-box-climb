@@ -63,7 +63,8 @@ OUTCOMES = ("success", "fall_contact", "fall_tilt", "time_out")  # priority if s
 
 
 def main():
-    env_cfg = resolve_presets(JumpTrackEnvCfg().configure(args.jump, str(reference)))
+    # shared jump rules only: no training aids (early stop, part-way starts), full start/box ranges
+    env_cfg = resolve_presets(JumpTrackEnvCfg().configure(args.jump, str(reference)).eval_mode())
     env_cfg.scene.num_envs = args.num_envs
     env_cfg.sim.device = args.device
     env = RslRlVecEnvWrapper(ManagerBasedRLEnv(cfg=env_cfg))

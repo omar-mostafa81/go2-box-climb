@@ -436,17 +436,34 @@ exp(−error²/std²), 1 when perfect.
 
 | Term | Weight | std | Purpose |
 | --- | --- | --- | --- |
-| joint angles (sum of the 12 squared errors) | +2.0 | 0.6 rad | follow the planned motion |
-| base height | +1.0 | 0.05 m | jump high enough, land at the right height |
-| base horizontal position | +1.0 | 0.15 m | follow the path (loose: the landing may shift to the actual box) |
-| base orientation (rotation angle) | +1.0 | 0.3 rad | keep the planned body attitude |
+| base height | +2.0 | 0.15 m | actually jump: leave the ground, land at the right height |
+| base horizontal position | +2.0 | 0.3 m | follow the path onto the actual box |
+| base orientation (rotation angle) | +1.0 | 0.4 rad | keep the planned body attitude |
+| joint angles (sum of the 12 squared errors) | +1.0 | 0.6 rad | follow the planned leg motion |
 | foot contacts match the plan (fraction of feet) | +0.5 | — | take off and land on time |
+| feet on the target surface (fraction), from the planned landing on | +1.0 | — | be on the box (platform) after the landing |
 | success (once) | +250 | — | land and settle |
 | fall (once) | −250 | — | avoid falls |
 | action change², torque², joint acceleration², joint limits | −0.01, −2e-4, −2.5e-7, −5.0 | — | smooth, low effort |
 
 Isaac Lab multiplies every term by 0.02 s, so the one-time success bonus and fall
-penalty are worth ±5.
+penalty are worth ±5. The body's path weighs more than the joint angles and its widths
+are generous: copying the leg motion while staying on the ground must not pay off, and
+getting closer to the planned path must still be rewarded when the robot is far from it.
+
+**Training aids** (training only; evaluation and playback switch them off with
+`eval_mode()` and judge with the shared rules alone):
+- *Early stop:* an attempt ends when the base is more than 0.3 m from the reference.
+  An attempt that has given up on the jump ends at once instead of collecting tracking
+  reward for its legs.
+- *Starts part-way through the jump* (reference state initialization): half of the
+  attempts start at a random time of the reference, in its pose and with its velocities
+  (2 cm higher, so never inside the box). The policy practices the flight and the landing
+  from the beginning instead of having to discover the take-off first.
+- *Curriculum:* the start and box ranges below grow from the nominal values (planned
+  start, box flush, centered, square, robot straight) to the full shared ranges between
+  iterations 200 and 1000. The plan has little room for error, so the policy first learns
+  the nominal jump.
 
 **Episode end** (shared jump rules in `common/constants.py`, the same as the
 from-scratch policy):
@@ -457,16 +474,19 @@ from-scratch policy):
 - *Fall:* trunk or head touches anything, or the body tilts more than 60°.
 - *Time limit:* 3.0 s.
 
-**Randomization.** Start conditions above; body friction 0.4–1.25 and base mass ±25%
-(as in walking).
+**Randomization.** Start conditions above (with the curriculum); body friction
+0.4–1.25 (as in walking) and base mass ±10%. The mass range is narrower than walking's
+±25%, because the TO part's MuJoCo check found the planned jump sensitive to the mass.
 
 **Training.** PPO (rsl_rl) with the walking policy's settings as the start: 4096 robots,
 24 steps per robot per update, actor and critic MLPs 512-256-128 (ELU), learning rate
 1e-3 (adaptive, target KL 0.01), γ 0.99, λ 0.95, clip 0.2, entropy 0.01, 5 epochs × 4
-mini-batches, 1500 iterations. Episodes are not started at random lengths, because each
-one must begin at reference time 0. Besides the shared plots, each run draws
-`plots/jump.png`: how the attempts end (success, contact fall, tilt fall, time limit),
-the joint and base tracking errors, and the episode length.
+mini-batches, 1500 iterations (about 1 h on an A100). Episodes are not started at random
+lengths, because each one must begin at its own reference time. Besides the shared plots,
+each run draws `plots/jump.png`: how the attempts end (success, contact fall, tilt fall,
+time limit, early stop), the curriculum level, the joint and base tracking errors, and the
+episode length. The training success rate includes the attempts started part-way through
+the jump; the real measure is `eval.py`.
 
 **Checks without training.** `play.py --open_loop` and `eval.py --open_loop` drive the
 motors straight from the reference's joint angles, with no policy. This tests the
